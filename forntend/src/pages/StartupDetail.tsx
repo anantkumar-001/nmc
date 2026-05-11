@@ -2,15 +2,78 @@ import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
+import { WalletSendTransactionError } from "@solana/wallet-adapter-base";
 import {
   PublicKey,
+  SendTransactionError,
   SystemProgram,
-  Transaction,
-  TransactionInstruction,
   LAMPORTS_PER_SOL,
+  Transaction,
+  TransactionMessage,
+  VersionedTransaction,
 } from "@solana/web3.js";
+import axios from "axios";
 import { startups, invest } from "../lib/api";
 import { useAuth } from "../context/AuthContext";
+
+/** Deep log for Wallet Standard / Phantom opaque failures — check browser console. */
+function logWalletSendTransactionFailure(
+  label: string,
+  error: unknown
+): void {
+  console.group(`[invest] ${label}`);
+  console.error("raw:", error);
+  if (error instanceof WalletSendTransactionError) {
+    console.error("WalletSendTransactionError.message:", error.message);
+    console.error("WalletSendTransactionError.name:", error.name);
+    console.error("WalletSendTransactionError.error (nested):", error.error);
+    const inner = error.error;
+    if (inner instanceof SendTransactionError) {
+      console.error("SendTransactionError.transactionError:", inner.transactionError);
+      console.error("SendTransactionError.logs:", inner.logs);
+    }
+    if (inner instanceof Error) {
+      console.error("inner.stack:", inner.stack);
+    }
+    if (inner && typeof inner === "object") {
+      const o = inner as Record<string, unknown>;
+      if ("logs" in o) console.error("inner.logs:", o.logs);
+      if ("data" in o) console.error("inner.data:", o.data);
+    }
+  }
+  console.groupEnd();
+}
+
+function investErrorMessage(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const data = error.response?.data as
+      | { error?: string; details?: string }
+      | undefined;
+    if (data?.details && typeof data.details === "string") return data.details;
+    if (data?.error && typeof data.error === "string") return data.error;
+  }
+  if (error instanceof WalletSendTransactionError) {
+    const inner = error.error;
+    if (inner instanceof SendTransactionError) {
+      const logs = inner.logs?.length
+        ? `\nLogs:\n${inner.logs.slice(-15).join("\n")}`
+        : "";
+      return `${error.message}: ${inner.message}${logs}`;
+    }
+    const innerMsg =
+      inner instanceof Error
+        ? inner.message
+        : inner && typeof inner === "object" && "message" in inner
+          ? String((inner as { message: unknown }).message)
+          : "";
+    if (innerMsg && innerMsg !== "Internal error") {
+      return `${error.message}${innerMsg ? `: ${innerMsg}` : ""}`;
+    }
+    return `${error.message}. Open the browser console for the expanded [invest] log. Common causes: Phantom not on Devnet, VITE_SOLANA_NETWORK=devnet + RPC URL must contain "devnet" (or use our auto-hint in solanaRpc.ts), flaky public RPC (use Helius), or VITE_ESCROW_WALLET must be a normal wallet — not the system program (1111…).`;
+  }
+  if (error instanceof Error) return error.message;
+  return "Investment failed";
+}
 
 const VALUATION = 20_000;
 const ESCROW_WALLET = import.meta.env.VITE_ESCROW_WALLET ?? "";
@@ -57,7 +120,7 @@ export function StartupDetail() {
   const [investError, setInvestError] = useState("");
   const [countdown, setCountdown] = useState("");
 
-  const { publicKey, sendTransaction, wallet } = useWallet();
+  const { publicKey, sendTransaction, signTransaction, wallet } = useWallet();
   const { setVisible: setWalletModalVisible } = useWalletModal();
   const { connection } = useConnection();
   const { user } = useAuth();
@@ -113,6 +176,18 @@ export function StartupDetail() {
 
       const escrowPubkey = new PublicKey(ESCROW_WALLET);
       const lamports = Math.floor(amountSol * LAMPORTS_PER_SOL);
+      if (lamports < 1) {
+        setInvestError("Amount is too small to send (needs at least ~0.000000001 SOL).");
+        return;
+      }
+
+      const balance = await connection.getBalance(publicKey);
+      const feeEstimate = 5000;
+      if (balance < lamports + feeEstimate) {
+        setInvestError(`Insufficient balance. You have ${balance / LAMPORTS_PER_SOL} SOL, but need ${amountSol + (feeEstimate / LAMPORTS_PER_SOL)} SOL (including network fee).`);
+        setInvesting(false);
+        return;
+      }
 
       const transferInstruction = SystemProgram.transfer({
         fromPubkey: publicKey,
@@ -120,22 +195,118 @@ export function StartupDetail() {
         lamports,
       });
 
-      const memoInstruction = new TransactionInstruction({
-        keys: [],
-        programId: new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"),
-        data: Buffer.from(`startup:${id}`),
+      let blockhash: string;
+      let lastValidBlockHeight: number;
+      let signature: string;
+
+      const buildTx = (recentBlockhash: string) =>
+        new VersionedTransaction(
+          new TransactionMessage({
+            payerKey: publicKey,
+            recentBlockhash,
+            instructions: [transferInstruction],
+          }).compileToV0Message()
+        );
+
+      const sendOpts = (skipPreflight: boolean) => ({
+        skipPreflight,
+        maxRetries: 5,
+        preflightCommitment: "confirmed" as const,
       });
 
-      const { blockhash, lastValidBlockHeight } =
-        await connection.getLatestBlockhash();
+      const fresh = await connection.getLatestBlockhash("confirmed");
+      blockhash = fresh.blockhash;
+      lastValidBlockHeight = fresh.lastValidBlockHeight;
+      let tx = buildTx(blockhash);
 
-      const transaction = new Transaction({
-        feePayer: publicKey,
-        blockhash,
-        lastValidBlockHeight,
-      }).add(transferInstruction, memoInstruction);
+      // RPC-side simulation (does not use Phantom) — surfaces invalid ix / balance / cluster issues.
+      try {
+        const { value: sim } = await connection.simulateTransaction(tx, {
+          sigVerify: false,
+          replaceRecentBlockhash: true,
+          commitment: "confirmed",
+        });
+        if (sim.err) {
+          const logText = sim.logs?.join("\n") ?? "";
+          console.error("[invest] simulateTransaction (v0): err=", sim.err, "logs=", sim.logs);
+          throw new Error(
+            `Simulation failed (check cluster + escrow + balance):\n${JSON.stringify(sim.err)}${logText ? `\n${logText.slice(0, 4000)}` : ""}`
+          );
+        }
+      } catch (simErr) {
+        if (simErr instanceof Error && simErr.message.startsWith("Simulation failed")) {
+          throw simErr;
+        }
+        console.warn(
+          "[invest] simulateTransaction threw (RPC flake); continuing to wallet send:",
+          simErr
+        );
+      }
 
-      const signature = await sendTransaction(transaction, connection);
+      try {
+        signature = await sendTransaction(tx, connection, sendOpts(false));
+      } catch (firstErr) {
+        if (!(firstErr instanceof WalletSendTransactionError)) throw firstErr;
+        logWalletSendTransactionFailure(
+          "sendTransaction v0 skipPreflight=false",
+          firstErr
+        );
+
+        const again = await connection.getLatestBlockhash("confirmed");
+        blockhash = again.blockhash;
+        lastValidBlockHeight = again.lastValidBlockHeight;
+
+        const legacyTx = new Transaction({
+          feePayer: publicKey,
+          blockhash,
+          lastValidBlockHeight,
+        }).add(transferInstruction);
+
+        try {
+          // Legacy overload: (tx, signers?, ...) — do not pass a config object here.
+          const { value: simLegacy } =
+            await connection.simulateTransaction(legacyTx);
+          if (simLegacy.err) {
+            console.error(
+              "[invest] simulateTransaction (legacy): err=",
+              simLegacy.err,
+              "logs=",
+              simLegacy.logs
+            );
+          }
+        } catch (e) {
+          console.warn("[invest] legacy simulate threw:", e);
+        }
+
+        try {
+          signature = await sendTransaction(
+            legacyTx,
+            connection,
+            sendOpts(true)
+          );
+        } catch (legacySendErr) {
+          logWalletSendTransactionFailure(
+            "sendTransaction legacy skipPreflight=true",
+            legacySendErr
+          );
+          tx = buildTx(blockhash);
+          try {
+            signature = await sendTransaction(tx, connection, sendOpts(true));
+          } catch (v0SkipErr) {
+            logWalletSendTransactionFailure(
+              "sendTransaction v0 skipPreflight=true",
+              v0SkipErr
+            );
+            if (!signTransaction) throw firstErr;
+            const signed = await signTransaction(tx);
+            signature = await connection.sendRawTransaction(signed.serialize(), {
+              skipPreflight: true,
+              maxRetries: 5,
+              preflightCommitment: "confirmed",
+            });
+          }
+        }
+      }
 
       await connection.confirmTransaction({
         signature,
@@ -157,10 +328,11 @@ export function StartupDetail() {
       setStartup(data);
       setInvestAmount("");
     } catch (error: unknown) {
+      if (error instanceof WalletSendTransactionError) {
+        logWalletSendTransactionFailure("handleInvestWithAmount (final catch)", error);
+      }
       console.error(error);
-      setInvestError(
-        error instanceof Error ? error.message : "Investment failed"
-      );
+      setInvestError(investErrorMessage(error));
     } finally {
       setInvesting(false);
     }

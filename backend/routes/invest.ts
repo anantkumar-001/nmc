@@ -69,8 +69,8 @@ investRouter.post("/", authMiddleware, async (req: AuthRequest, res) => {
     const investmentUSD = amount * SOL_PER_USD;
     const stake = investmentUSD / VALUATION;
 
-    const [investment] = await prisma.$transaction([
-      prisma.investment.create({
+    const investment = await prisma.$transaction(async (tx) => {
+      const inv = await tx.investment.create({
         data: {
           startupId,
           investorId: userId,
@@ -78,12 +78,13 @@ investRouter.post("/", authMiddleware, async (req: AuthRequest, res) => {
           stake,
           txHash,
         },
-      }),
-      prisma.startup.update({
+      });
+      await tx.startup.update({
         where: { id: startupId },
         data: { totalRaised: { increment: investmentUSD } },
-      }),
-    ]);
+      });
+      return inv;
+    });
 
     res.status(201).json(investment);
   } catch (err) {

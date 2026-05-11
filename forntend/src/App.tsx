@@ -3,8 +3,6 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
 import {
-  PhantomWalletAdapter,
-  SolflareWalletAdapter,
   CoinbaseWalletAdapter,
   TrustWalletAdapter,
   LedgerWalletAdapter,
@@ -21,14 +19,15 @@ import { StartupDetail } from "./pages/StartupDetail";
 import { Build } from "./pages/Build";
 import { Portfolio } from "./pages/Portfolio";
 import Landing from "./pages/Landing";
+import { getSolanaConnectionEndpoint } from "./lib/solanaRpc";
 
-const SOLANA_RPC = import.meta.env.VITE_SOLANA_RPC ?? "https://api.devnet.solana.com";
+const SOLANA_RPC = getSolanaConnectionEndpoint();
 
 function App() {
+  // Phantom / Solflare are injected via Wallet Standard — listing legacy adapters too
+  // duplicates them and can cause WalletSendTransactionError("Internal error") on send.
   const wallets = useMemo(
     () => [
-      new PhantomWalletAdapter(),
-      new SolflareWalletAdapter(),
       new CoinbaseWalletAdapter(),
       new TrustWalletAdapter(),
       new LedgerWalletAdapter(),

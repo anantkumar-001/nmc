@@ -3,11 +3,29 @@ import {
   PublicKey,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
+import type { ParsedTransactionWithMeta } from "@solana/web3.js";
 import { ESCROW_WALLET } from "../config/env.js";
 
 const RPC_URL = process.env.SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Balance arrays follow [static keys…, loaded writable…, loaded readonly…] for v0 txs. */
+function accountKeysForBalanceLookup(tx: ParsedTransactionWithMeta): PublicKey[] {
+  const meta = tx.meta;
+  const staticKeys = tx.transaction.message.accountKeys.map((a) => a.pubkey);
+  const preLen = meta?.preBalances?.length ?? staticKeys.length;
+  if (staticKeys.length === preLen) return staticKeys;
+  const loaded = meta?.loadedAddresses;
+  if (
+    loaded &&
+    staticKeys.length < preLen &&
+    (loaded.writable.length > 0 || loaded.readonly.length > 0)
+  ) {
+    return [...staticKeys, ...loaded.writable, ...loaded.readonly];
+  }
+  return staticKeys;
+}
 
 export interface VerificationResult {
   success: boolean;
@@ -29,33 +47,63 @@ export async function verifyTransaction(
   const connection = new Connection(RPC_URL, "confirmed");
 
   try {
-    // Retry up to 5 times with 3s delay — RPC indexing can lag behind confirmation
-    let tx = null;
+    // Retry: RPC indexing lag + flaky public RPCs often throw "Internal error" on getParsedTransaction
+    let tx: ParsedTransactionWithMeta | null = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
-      tx = await connection.getParsedTransaction(txHash, {
-        maxSupportedTransactionVersion: 0,
-        commitment: "confirmed",
-      });
+      try {
+        tx = await connection.getParsedTransaction(txHash, {
+          maxSupportedTransactionVersion: 0,
+          commitment: "confirmed",
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(
+          `verifyTransaction: getParsedTransaction failed (attempt ${attempt}/5):`,
+          msg
+        );
+        tx = null;
+      }
       if (tx) break;
-      console.log(`verifyTransaction: attempt ${attempt}/5 — tx not yet indexed, retrying in 3s…`);
-      await sleep(3000);
+      if (attempt < 5) {
+        console.log(
+          `verifyTransaction: attempt ${attempt}/5 — missing tx or RPC error, retrying in 3s…`
+        );
+        await sleep(3000);
+      }
     }
 
     if (!tx) {
-      return { success: false, error: "Transaction not found after retries. Please try again in a few seconds." };
+      return {
+        success: false,
+        error:
+          "Could not load the transaction from Solana RPC after retries. Try again in a moment, or set SOLANA_RPC_URL to a reliable endpoint (e.g. Helius devnet).",
+      };
     }
 
     if (tx.meta?.err) {
       return { success: false, error: "Transaction failed on-chain" };
     }
 
-    // Find SOL transfer from sender to escrow
-    const accountKeys = tx.transaction.message.accountKeys;
+    // Find SOL transfer from sender to escrow (full key order must match preBalances indices)
+    const accountKeys = accountKeysForBalanceLookup(tx);
+    const preBalances = tx.meta?.preBalances ?? [];
+    const postBalances = tx.meta?.postBalances ?? [];
+    if (
+      preBalances.length > 0 &&
+      accountKeys.length !== preBalances.length
+    ) {
+      return {
+        success: false,
+        error:
+          "Could not verify transaction: account keys do not match balance metadata.",
+      };
+    }
+
     const senderIndex = accountKeys.findIndex(
-      (k) => k.pubkey.toBase58() === expectedSender
+      (k) => k.toBase58() === expectedSender
     );
     const escrowIndex = accountKeys.findIndex(
-      (k) => k.pubkey.toBase58() === ESCROW_WALLET
+      (k) => k.toBase58() === ESCROW_WALLET
     );
 
     if (senderIndex < 0) {
@@ -66,8 +114,6 @@ export async function verifyTransaction(
     }
 
     // Parse balance changes from pre/post
-    const preBalances = tx.meta?.preBalances ?? [];
-    const postBalances = tx.meta?.postBalances ?? [];
     const lamportsReceived =
       (postBalances[escrowIndex] ?? 0) - (preBalances[escrowIndex] ?? 0);
     const lamportsSent =
