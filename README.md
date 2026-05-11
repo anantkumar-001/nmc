@@ -83,7 +83,6 @@ NMC/
 │   │   ├── lib/             # API client (axios)
 │   │   └── pages/           # Landing, Login, Signup, Startups, StartupDetail, Build, Portfolio
 │   └── public/
-├── testsprite_tests/        # TestSprite / PRD-related assets
 └── README.md
 ```
 

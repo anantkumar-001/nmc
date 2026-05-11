@@ -20,6 +20,3 @@ logs
 # editor
 .vscode
 .idea
-
-# TestSprite generated / local run output
-testsprite_tests/tmp/
